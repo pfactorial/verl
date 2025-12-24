@@ -50,7 +50,7 @@ class ParameterSynchronizer:
         self.sglang_servers = None
         if self.is_sglang:
             self.sglang_servers = ray.get(rollouter.get_sglang_servers.remote())
-            logger.info(f"[ParameterSynchronizer] Using SGLang backend with {len(self.sglang_servers)} servers")
+            print(f"[ParameterSynchronizer] Using SGLang backend with {len(self.sglang_servers)} servers")
             # Note: SGLang servers are CPU-only Ray actors, they can't participate in NCCL
             # Weight sync uses Ray object store for GPU tensor transfer instead
 
@@ -70,7 +70,7 @@ class ParameterSynchronizer:
         if self.config.async_training.checkpoint_engine.enable:
             if self.is_sglang:
                 # SGLang doesn't use checkpoint_engine (uses NCCL directly to servers)
-                logger.debug("[ParameterSynchronizer] Skipping checkpoint_engine for SGLang (uses direct NCCL sync)")
+                print("[ParameterSynchronizer] Skipping checkpoint_engine for SGLang (uses direct NCCL sync)")
             else:
                 self._init_actor_rollout_checkpoint_engine()
 
@@ -91,7 +91,7 @@ class ParameterSynchronizer:
             self.rollout_wg.set_actor_weights_info(self.weights_info)
 
     def _init_sync_group(self):
-        logger.info("[ParameterSynchronizer] Initializing parameter synchronization group...")
+        print("[ParameterSynchronizer] Initializing parameter synchronization group...")
 
         if self.is_sglang:
             # For SGLang, only create collective among actor workers
@@ -104,7 +104,7 @@ class ParameterSynchronizer:
                 backend=get_nccl_backend(),
                 group_name=self.sync_group_name,
             )
-            logger.debug(f"[ParameterSynchronizer] SGLang NCCL group: {len(self.actor_wg.workers)} actor workers only")
+            print(f"[ParameterSynchronizer] SGLang NCCL group: {len(self.actor_wg.workers)} actor workers only")
         else:
             # For vLLM, create collective with actor workers + rollout workers
             actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
@@ -217,7 +217,7 @@ class ParameterSynchronizer:
         flush_futures = [server.flush_cache.remote() for server in self.sglang_servers]
         ray.get(flush_futures)
 
-        logger.debug(f"[ParameterSynchronizer] SGLang weight sync complete: {len(self.sglang_servers)} servers updated ({batch_count} batches)")
+        print(f"[ParameterSynchronizer] SGLang weight sync complete: {len(self.sglang_servers)} servers updated ({batch_count} batches)")
 
     def wait_last_valid(self):
         print("[ParameterSynchronizer] Waiting last sync and validate...")
