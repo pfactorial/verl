@@ -17,31 +17,47 @@ SGLang async server with support for partial rollouts (cancellation mid-generati
 This is the SGLang equivalent of recipe/fully_async_policy/vllm_rollout/vllm_async_server.py
 """
 import asyncio
+import dataclasses
+import json
 import logging
 import os
 from typing import Any, Optional, Sequence
 
 import ray
+import sglang
+import sglang.srt.entrypoints.engine
+import torch
 from ray.actor import ActorHandle
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.entrypoints.http_server import (
+    ServerArgs,
+    _GlobalState,
+    _launch_subprocesses,
+    app,
+    set_global_state,
+)
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import ServerStatus
 
+from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
-from verl.workers.rollout.sglang_rollout.async_sglang_server import (
-    SGLangHttpServer,
-    SGLangReplica,
-)
-from verl.workers.rollout.utils import is_valid_ipv6_address
+from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangReplica
+from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
+from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
 @ray.remote(num_cpus=1)
-class SGLangHttpServerForPartial(SGLangHttpServer):
+class SGLangHttpServerForPartial:
     """SGLang HTTP server with support for partial rollouts (cancellation mid-generation).
 
-    This extends SGLangHttpServer to add:
+    This is a standalone actor class (not inheriting from SGLangHttpServer) that provides:
     - generate_for_partial(): Generation that can be cancelled mid-way
     - cancel(): Cancel all ongoing generations
     - resume(): Resume after cancellation
@@ -61,16 +77,192 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         nnodes: int,
         cuda_visible_devices: str,
     ):
-        super().__init__(
-            config, model_config, rollout_mode, workers,
-            replica_rank, node_rank, nnodes, cuda_visible_devices
-        )
+        print(f"SGLang http server (partial): {rollout_mode=}, {replica_rank=}, {node_rank=}, {nnodes=}, {cuda_visible_devices=}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+        assert torch.cuda.is_available(), "SGLang http server should run on GPU node"
+
+        self.config: RolloutConfig = omega_conf_to_dataclass(config)
+        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        self.rollout_mode = rollout_mode
+        self.workers = workers
+
+        self.replica_rank = replica_rank
+        self.node_rank = node_rank
+        self.nnodes = nnodes
+
+        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+            logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+            self.config.load_format = "auto"
+
+        # used for http server
+        self._server_address = ray.util.get_node_ip_address().strip("[]")
+        self._server_port = None
+
+        # used for NCCL process group
+        if self.node_rank == 0:
+            self._master_address = self._server_address
+            self._master_port, self._master_sock = get_free_port(self._server_address)
+            logger.info(
+                f"SGLangHttpServerForPartial, replica_rank: {self.replica_rank}, "
+                f"master address: {self._master_address}, port: {self._master_port}"
+            )
+        else:
+            self._master_address = None
+            self._master_port = None
 
         # For cancel functionality
         self.paused = False
         self.lock = asyncio.Lock()
         self.cancel_event: dict[str, asyncio.Event] = {}
         self.req_output: dict[str, Optional[dict]] = {}
+
+    def get_master_address(self):
+        """Get master address and port for init NCCL process group."""
+        return self._master_address, self._master_port
+
+    def get_server_address(self):
+        """Get http server address and port."""
+        assert self._server_port is not None, "http server is not launched, port is None"
+        return self._server_address, self._server_port
+
+    async def launch_server(self, master_address: str = None, master_port: int = None):
+        if self.node_rank != 0:
+            assert master_address and master_port, "non-master node should provide master address and port"
+            self._master_address = master_address
+            self._master_port = master_port
+
+        engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
+        attention_backend = engine_kwargs.pop("attention_backend", None)
+        quantization = self.config.get("quantization", None)
+        fp8_block_quant_kwargs = None
+        if quantization is not None:
+            if quantization == "fp8":
+                assert sglang.__version__ >= "0.5.5", "sglang>=0.5.5 is required for FP8 quantization"
+                FP8_BLOCK_QUANT_KWARGS = {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                }
+                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+            else:
+                raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
+        dist_init_addr = (
+            f"[{self._master_address}]:{self._master_port}"
+            if is_valid_ipv6_address(self._master_address)
+            else f"{self._master_address}:{self._master_port}"
+        )
+
+        args = {
+            "model_path": self.model_config.local_path,
+            "dtype": self.config.dtype,
+            "mem_fraction_static": self.config.gpu_memory_utilization,
+            "disable_cuda_graph": self.config.enforce_eager,
+            "enable_memory_saver": True,
+            "base_gpu_id": 0,
+            "gpu_id_step": 1,
+            "tp_size": self.config.tensor_model_parallel_size,
+            "dp_size": self.config.data_parallel_size,
+            "ep_size": self.config.expert_parallel_size,
+            "node_rank": self.node_rank,
+            "load_format": self.config.load_format,
+            "dist_init_addr": dist_init_addr,
+            "nnodes": self.nnodes,
+            "trust_remote_code": self.model_config.trust_remote_code,
+            "max_running_requests": self.config.get("max_num_seqs", None),
+            "log_level": "error",
+            "mm_attention_backend": "fa3",
+            "attention_backend": attention_backend if attention_backend is not None else "fa3",
+            "skip_tokenizer_init": self.config.skip_tokenizer_init,
+            "skip_server_warmup": True,
+            "quantization": quantization,
+            "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
+            if quantization == "fp8"
+            else json.dumps({}),
+            **engine_kwargs,
+        }
+
+        if self.config.prometheus.enable:
+            if self.config.prometheus.served_model_name:
+                # Extract model name from path if it's a full path
+                served_model_name = self.config.prometheus.served_model_name
+                if "/" in served_model_name:
+                    # If it's a full path, extract the last part as model name
+                    served_model_name = served_model_name.split("/")[-1]
+                args["served_model_name"] = served_model_name
+
+            # start sglang metrics
+            args["enable_metrics"] = True
+
+        # enable_weights_cpu_backup is supported in sglang>=0.5.3
+        if "enable_weights_cpu_backup" in [f.name for f in dataclasses.fields(ServerArgs)]:
+            enable_weights_cpu_backup = True if self.rollout_mode == RolloutMode.COLOCATED else False
+            args["enable_weights_cpu_backup"] = enable_weights_cpu_backup
+
+        # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
+        # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
+        sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+        os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+        server_args = ServerArgs(**args)
+        self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+            server_args=server_args
+        )
+
+        # In multi-node cases, non-zero rank nodes should not launch http server.
+        if self.node_rank > 0:
+            return
+
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=self.tokenizer_manager,
+                template_manager=self.template_manager,
+                scheduler_info=self.scheduler_info,
+            )
+        )
+        app.is_single_tokenizer_mode = True
+
+        # Set warmup_thread_args to avoid AttributeError in lifespan function
+        app.warmup_thread_args = (
+            server_args,
+            None,
+            None,
+        )
+
+        # Manually add Prometheus middleware before starting server
+        # This ensures /metrics endpoint is available immediately
+        if server_args.enable_metrics:
+            from sglang.srt.utils.common import add_prometheus_middleware
+
+            add_prometheus_middleware(app)
+
+        self._server_port, self._server_task = await run_unvicorn(app, server_args, self._server_address)
+        self.tokenizer_manager.server_status = ServerStatus.Up
+
+    async def wake_up(self):
+        if self.rollout_mode == RolloutMode.HYBRID:
+            # Call all workers to switch between trainer mode and rollout mode.
+            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+        elif self.rollout_mode == RolloutMode.COLOCATED:
+            # Directly call engine to wake up without sync weights.
+            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            await self.tokenizer_manager.resume_memory_occupation(obj, None)
+            await self.tokenizer_manager.flush_cache()
+        elif self.rollout_mode == RolloutMode.STANDALONE:
+            logger.info("skip wake_up in standalone mode")
+
+    async def sleep(self):
+        if self.rollout_mode == RolloutMode.HYBRID:
+            await asyncio.gather(*[worker.sleep.remote() for worker in self.workers])
+        elif self.rollout_mode == RolloutMode.COLOCATED:
+            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            await self.tokenizer_manager.release_memory_occupation(obj, None)
+        elif self.rollout_mode == RolloutMode.STANDALONE:
+            logger.info("skip sleep in standalone mode")
+
+    async def clear_kv_cache(self):
+        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.release_memory_occupation(obj, None)
 
     async def _generate_step(
         self,
