@@ -287,6 +287,8 @@ class SGLangHttpServerForPartial:
         # SGLang uses return_logprob at request level, not logprobs in sampling_params
         sampling_params.pop("logprobs", None)
 
+        logger.info(f"[SGLang Server {self.replica_rank}] Starting generation: request_id={request_id}, prompt_len={len(prompt_ids)}, max_new_tokens={max_new_tokens}")
+
         request = GenerateReqInput(
             rid=request_id,
             input_ids=prompt_ids,
@@ -298,6 +300,10 @@ class SGLangHttpServerForPartial:
         # SGLang uses async generator - get the final output
         output = await self.tokenizer_manager.generate_request(request, None).__anext__()
         self.req_output[request_id] = output
+
+        # Log completion
+        output_len = len(output.get("output_ids", [])) if output else 0
+        logger.info(f"[SGLang Server {self.replica_rank}] Generation complete: request_id={request_id}, output_len={output_len}")
 
     async def generate_for_partial(
         self,
