@@ -23,7 +23,7 @@ from verl.utils.device import get_nccl_backend
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class ParameterSynchronizer:
     """
     Unified parameter synchronizer, responsible for synchronizing model parameters between actor and rollout
