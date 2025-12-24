@@ -479,6 +479,10 @@ class FullyAsyncSGLangReplica(SGLangReplica):
 
     This extends SGLangReplica to use SGLangHttpServerForPartial instead of
     the regular SGLangHttpServer, enabling mid-generation cancellation.
+
+    Key difference from base SGLangReplica:
+    - Doesn't use ServerAdapter workers (which have FP8 config issues)
+    - Directly creates SGLangHttpServerForPartial actors
     """
 
     def __init__(
@@ -490,6 +494,18 @@ class FullyAsyncSGLangReplica(SGLangReplica):
         is_reward_model: bool = False,
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+
+    async def init_with_workers(self, worker_group):
+        """Initialize with workers from worker_group but use STANDALONE mode.
+
+        This is like init_hybrid but sets STANDALONE mode so that actual weights
+        are loaded instead of dummy weights.
+        """
+        self.rollout_mode = RolloutMode.STANDALONE  # Load real weights, not dummy
+        self.workers = worker_group.workers[
+            self.world_size * self.replica_rank : self.world_size * (self.replica_rank + 1)
+        ]
+        await self.launch_servers()
 
     async def launch_servers(self):
         """Launch http server in each node.
