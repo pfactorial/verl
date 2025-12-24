@@ -21,7 +21,6 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
-from recipe.fully_async_policy.vllm_rollout.vllm_async_server import FullyAsyncvLLMReplica
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
@@ -41,6 +40,31 @@ from verl.utils.rollout_trace import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def get_fully_async_replica_class(rollout_name: str):
+    """Get the appropriate replica class based on rollout engine.
+
+    Args:
+        rollout_name: The rollout engine name ('vllm' or 'sglang')
+
+    Returns:
+        The replica class for the specified engine
+
+    Raises:
+        ValueError: If the rollout engine is not supported
+    """
+    if rollout_name == "vllm":
+        from recipe.fully_async_policy.vllm_rollout.vllm_async_server import FullyAsyncvLLMReplica
+        return FullyAsyncvLLMReplica
+    elif rollout_name == "sglang":
+        from recipe.fully_async_policy.sglang_rollout.sglang_async_server import FullyAsyncSGLangReplica
+        return FullyAsyncSGLangReplica
+    else:
+        raise ValueError(
+            f"Unsupported rollout engine for fully async: {rollout_name}. "
+            f"Supported engines: 'vllm', 'sglang'"
+        )
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
@@ -217,7 +241,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         self.reward_model_manager = None
         self.reward_router_address = None
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
-        self.rollout_replica_class = FullyAsyncvLLMReplica
+
+        # Dynamically select replica class based on rollout engine
+        rollout_name = config.actor_rollout_ref.rollout.name
+        self.rollout_replica_class = get_fully_async_replica_class(rollout_name)
 
         self.rm_resource_pool = rm_resource_pool
         self.rollout_replicas = None
