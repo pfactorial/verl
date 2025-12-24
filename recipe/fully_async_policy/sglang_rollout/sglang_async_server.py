@@ -426,7 +426,7 @@ class SGLangHttpServerForPartial:
         # Get inference TP size from config
         infer_tp_size = self.config.tensor_model_parallel_size
 
-        logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
+        logger.debug(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
 
         # Serialize each tensor using SGLang's internal format
         named_tensors = []
@@ -461,7 +461,7 @@ class SGLangHttpServerForPartial:
         # Send to tokenizer_manager for model update
         await self.tokenizer_manager.update_weights_from_tensor(req.model_dump(), None)
 
-        logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
+        logger.debug(f"[SGLang Server {self.replica_rank}] Weight loading complete")
 
     async def flush_cache(self):
         """Flush the KV cache after weight updates."""
