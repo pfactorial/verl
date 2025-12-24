@@ -437,13 +437,14 @@ class SGLangHttpServerForPartial:
             for _ in range(infer_tp_size)
         ]
 
-        # Call tokenizer_manager directly (no HTTP overhead)
-        request = UpdateWeightsFromTensorReqInput(
+        # Create update request and send to tokenizer_manager
+        # Pass the request object directly (matches SGLang's HTTP handler behavior)
+        req = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
             load_format=None,
             flush_cache=flush_cache,
         )
-        await self.tokenizer_manager.update_weights_from_tensor(request, None)
+        await self.tokenizer_manager.update_weights_from_tensor(req, None)
 
         logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
 
