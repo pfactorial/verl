@@ -150,9 +150,9 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
             collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
 
             # Rank 0 collects all weights for SGLang
-            # Move to CPU since ParameterSynchronizer is a CPU-only Ray actor
+            # Detach and move to CPU since ParameterSynchronizer is a CPU-only Ray actor
             if torch.distributed.get_rank() == 0:
-                self._collected_weights.append((key, tensor.cpu()))
+                self._collected_weights.append((key, tensor.detach().cpu()))
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
