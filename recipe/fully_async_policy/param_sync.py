@@ -181,7 +181,11 @@ class ParameterSynchronizer:
 
         This is slightly slower than vLLM's direct NCCL approach, but still avoids
         HTTP serialization overhead by using Ray's efficient GPU tensor transfer.
+
+        For large models, weights are sent in batches to avoid memory pressure.
         """
+        from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
+
         # Step 1: Actor workers sync weights among themselves via NCCL
         # This is fast GPU-to-GPU transfer within actor workers
         ray.get(self.actor_wg.sync_actor_weights_internal(self.sync_group_name))
@@ -190,15 +194,28 @@ class ParameterSynchronizer:
         # Ray's object store handles GPU tensor transfer efficiently
         weights = ray.get(self.actor_wg.get_collected_weights())
 
-        # Step 3: Send weights to all SGLang servers in parallel
-        # Each server loads weights via tokenizer_manager
-        sglang_futures = [
-            server.load_weights.remote(weights)
-            for server in self.sglang_servers
-        ]
-        ray.get(sglang_futures)
+        # Step 3: Send weights to all SGLang servers in batches
+        # Use batching to reduce memory pressure for large models
+        update_weights_bucket_bytes = int(
+            self.config.actor_rollout_ref.rollout.get("update_weights_bucket_megabytes", 128)
+        ) << 20  # Default 128MB buckets
 
-        print(f"[ParameterSynchronizer] SGLang weight sync complete: {len(self.sglang_servers)} servers updated")
+        batch_count = 0
+        for weight_batch in get_named_tensor_buckets(iter(weights), update_weights_bucket_bytes):
+            # Send this batch to all SGLang servers in parallel
+            # Don't flush cache until all batches are loaded
+            sglang_futures = [
+                server.load_weights.remote(weight_batch, flush_cache=False)
+                for server in self.sglang_servers
+            ]
+            ray.get(sglang_futures)
+            batch_count += 1
+
+        # Flush cache after all batches are loaded
+        flush_futures = [server.flush_cache.remote() for server in self.sglang_servers]
+        ray.get(flush_futures)
+
+        print(f"[ParameterSynchronizer] SGLang weight sync complete: {len(self.sglang_servers)} servers updated ({batch_count} batches)")
 
     def wait_last_valid(self):
         print("[ParameterSynchronizer] Waiting last sync and validate...")

@@ -398,7 +398,7 @@ class SGLangHttpServerForPartial:
 
     # ==================== Weight Sync Methods ====================
 
-    async def load_weights(self, weights: list[tuple[str, torch.Tensor]]):
+    async def load_weights(self, weights: list[tuple[str, torch.Tensor]], flush_cache: bool = True):
         """Load weights into the SGLang model.
 
         This method receives weights from actor workers (via Ray object store)
@@ -408,33 +408,64 @@ class SGLangHttpServerForPartial:
         so they can't participate in NCCL directly. Weight tensors are passed
         via Ray's object store which handles GPU tensor transfer efficiently.
 
+        The serialization format follows SGLang's internal weight sync mechanism:
+        1. Each tensor is serialized with MultiprocessingSerializer
+        2. Tensors are wrapped in LocalSerializedTensor (one value per TP rank)
+        3. The entire list is serialized and sent to the engine
+
+        We receive FULL weights (not sharded) and replicate them for all TP ranks.
+        SGLang's model loader handles sharding internally when loading.
+
         Args:
             weights: List of (name, tensor) tuples to load
+            flush_cache: Whether to flush the KV cache after loading (default True)
         """
-        from sglang.srt.weight_sync.utils import named_tensor_to_bytes
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        from sglang.srt.utils import MultiprocessingSerializer
 
-        logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors...")
+        # Get inference TP size from config
+        infer_tp_size = self.config.tensor_model_parallel_size
 
-        # Serialize weights for SGLang's internal update mechanism
-        serialized_tensors = []
+        logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
+
+        # Serialize each tensor using SGLang's internal format
+        named_tensors = []
         for name, tensor in weights:
-            # Ensure tensor is contiguous for serialization
+            # Ensure tensor is contiguous and detached
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            serialized = named_tensor_to_bytes(name, tensor)
-            serialized_tensors.append(serialized)
+            tensor = tensor.detach()
+
+            # Serialize the tensor for IPC transfer
+            serialized_tensor = MultiprocessingSerializer.serialize(tensor)
+
+            # Wrap in LocalSerializedTensor
+            # Replicate full weight for all TP ranks - SGLang's model loader handles sharding
+            # This matches synchronous training where each worker contributes its full weight
+            named_tensors.append((name, LocalSerializedTensor(values=[serialized_tensor] * infer_tp_size)))
+
+        # Serialize the entire list of named tensors
+        # One entry per TP rank (each entry is identical, as in synchronous training)
+        serialized_named_tensors = [
+            MultiprocessingSerializer.serialize(named_tensors)
+            for _ in range(infer_tp_size)
+        ]
 
         # Create update request
         req = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=serialized_tensors,
+            serialized_named_tensors=serialized_named_tensors,
             load_format=None,
-            flush_cache=True,
+            flush_cache=flush_cache,
         )
 
         # Send to tokenizer_manager for model update
         await self.tokenizer_manager.update_weights_from_tensor(req.model_dump(), None)
 
         logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
+
+    async def flush_cache(self):
+        """Flush the KV cache after weight updates."""
+        await self.tokenizer_manager.flush_cache()
 
 
 class FullyAsyncSGLangReplica(SGLangReplica):
