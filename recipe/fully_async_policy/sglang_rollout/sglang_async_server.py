@@ -97,9 +97,20 @@ class SGLangHttpServerForPartial:
         self.node_rank = node_rank
         self.nnodes = nnodes
 
+        # For fully async training, we KEEP load_format='dummy' even in STANDALONE mode.
+        # The trainer will sync real weights (converted to FP8) via load_weights() before
+        # any generation starts. This avoids loading bf16 weights from disk which would
+        # crash with FP8 kernels.
+        #
+        # Original logic changed dummy->auto for STANDALONE, but that breaks FP8:
+        # - load_format='auto' loads bf16 weights from disk
+        # - quantization='fp8' uses FP8 kernels
+        # - bf16 weights + FP8 kernels = CUDA crash
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
-            logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
-            self.config.load_format = "auto"
+            logger.info(
+                f"[SGLang Server {self.replica_rank}] STANDALONE mode with load_format='dummy' - "
+                "keeping dummy weights. Real weights will be synced from trainer before generation."
+            )
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -142,19 +153,6 @@ class SGLangHttpServerForPartial:
         attention_backend = engine_kwargs.pop("attention_backend", None)
         quantization = self.config.get("quantization", None)
         fp8_block_quant_kwargs = None
-
-        # In STANDALONE mode, we load bf16 weights from disk initially.
-        # Using quantization='fp8' with bf16 weights causes CUDA crashes because
-        # the FP8 kernels expect FP8-formatted weights.
-        # The trainer will sync FP8 weights after the first parameter sync.
-        # So we disable FP8 at startup for STANDALONE mode - weights will be bf16
-        # until the first weight sync from trainer.
-        if self.rollout_mode == RolloutMode.STANDALONE and quantization == "fp8":
-            logger.warning(
-                f"[SGLang Server {self.replica_rank}] STANDALONE mode with quantization='fp8' - "
-                "disabling FP8 at startup to load bf16 weights. FP8 weights will be synced from trainer."
-            )
-            quantization = None
 
         if quantization is not None:
             if quantization == "fp8":
