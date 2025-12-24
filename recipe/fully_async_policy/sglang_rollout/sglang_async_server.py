@@ -151,7 +151,28 @@ class SGLangHttpServerForPartial:
 
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
         attention_backend = engine_kwargs.pop("attention_backend", None)
+
+        # IMPORTANT: For fully async training with STANDALONE mode, we DISABLE FP8 at the
+        # SGLang level. The issue is that load_format='dummy' + quantization='fp8' doesn't
+        # properly initialize SGLang's FP8 infrastructure when launched via _launch_subprocesses.
+        # This causes CUDA illegal memory access errors in flash_attn and deep_gemm.
+        #
+        # The workaround is:
+        # 1. SGLang runs in bf16 mode (no quantization)
+        # 2. Trainer still uses FP8 for training
+        # 3. Weight sync sends bf16 weights (no FP8 conversion in load_weights)
+        # 4. Inference runs in bf16
+        #
+        # This sacrifices some inference performance but avoids the FP8 initialization issues.
+        # TODO: Investigate using sgl_update_weights directly (requires engine access) for proper FP8 support.
         quantization = self.config.get("quantization", None)
+        if quantization == "fp8" and self.rollout_mode == RolloutMode.STANDALONE:
+            logger.warning(
+                f"[SGLang Server {self.replica_rank}] Disabling FP8 for STANDALONE mode due to "
+                "initialization issues with load_format='dummy'. Inference will use bf16."
+            )
+            quantization = None
+
         fp8_block_quant_kwargs = None
 
         if quantization is not None:
@@ -434,18 +455,10 @@ class SGLangHttpServerForPartial:
         # Get inference TP size from config
         infer_tp_size = self.config.tensor_model_parallel_size
 
-        # Convert bf16 weights to fp8 if quantization is enabled (matches sync training)
-        quantization = self.config.get("quantization", None)
-        if quantization == "fp8":
-            from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
-            logger.info(f"[SGLang Server {self.replica_rank}] Converting bf16 weights to fp8 format...")
-            # Use default FP8 blockwise config (128x128 blocks) - same as SGLang default
-            quant_config = {"weight_block_size": [128, 128]}
-            weights = quant_weights_by_name(
-                weights,
-                quant_config,
-                dtype=torch.bfloat16,
-            )
+        # NOTE: We do NOT convert to FP8 here for STANDALONE mode.
+        # SGLang is running in bf16 mode (see launch_server), so we send bf16 weights directly.
+        # The trainer may use FP8 internally, but weights passed here are already in bf16
+        # (from actor worker's get_collected_weights which returns bf16).
 
         logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
 
