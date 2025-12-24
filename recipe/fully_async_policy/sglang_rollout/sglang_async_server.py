@@ -399,17 +399,15 @@ class SGLangHttpServerForPartial:
     # ==================== Weight Sync Methods ====================
 
     async def load_weights(self, weights: list[tuple[str, torch.Tensor]], flush_cache: bool = True):
-        """Load weights into the SGLang model via HTTP.
+        """Load weights into the SGLang model directly via tokenizer_manager.
 
         This method receives weights from actor workers (via Ray object store)
-        and loads them into the SGLang model via HTTP endpoint.
+        and loads them into the SGLang model by calling tokenizer_manager directly.
 
         Args:
             weights: List of (name, tensor) tuples to load
             flush_cache: Whether to flush the KV cache after loading (default True)
         """
-        import base64
-        import aiohttp
         from sglang.srt.model_executor.model_runner import LocalSerializedTensor
         from sglang.srt.utils import MultiprocessingSerializer
 
@@ -433,30 +431,19 @@ class SGLangHttpServerForPartial:
             # Replicate full weight for all TP ranks - SGLang's model loader handles sharding
             named_tensors.append((name, LocalSerializedTensor(values=[serialized_tensor] * infer_tp_size)))
 
-        # Serialize the entire list of named tensors
+        # Serialize the entire list of named tensors for each TP rank
         serialized_named_tensors = [
             MultiprocessingSerializer.serialize(named_tensors)
             for _ in range(infer_tp_size)
         ]
 
-        # Base64 encode for HTTP transport (same as AsyncHttpServerAdapter)
-        encoded_tensors = [
-            base64.b64encode(t).decode("utf-8") for t in serialized_named_tensors
-        ]
-
-        # Send via HTTP to the local server
-        url = f"http://{self._server_address}:{self._server_port}/update_weights_from_tensor"
-        payload = {
-            "serialized_named_tensors": encoded_tensors,
-            "load_format": None,
-            "flush_cache": flush_cache,
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise RuntimeError(f"Weight update failed: {resp.status} - {text}")
+        # Call tokenizer_manager directly (no HTTP overhead)
+        request = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=None,
+            flush_cache=flush_cache,
+        )
+        await self.tokenizer_manager.update_weights_from_tensor(request, None)
 
         logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
 
