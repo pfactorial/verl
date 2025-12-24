@@ -156,9 +156,13 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
 
-    @register(dispatch_mode=Dispatch.RANK_ZERO)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_collected_weights(self):
-        """Get collected weights from rank 0 for SGLang weight sync."""
+        """Get collected weights for SGLang weight sync.
+
+        Only rank 0 has collected weights (from sync_actor_weights_internal).
+        Other ranks return empty list. Caller should use result[0].
+        """
         if not hasattr(self, "_collected_weights"):
             return []
         weights = self._collected_weights

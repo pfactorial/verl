@@ -192,7 +192,9 @@ class ParameterSynchronizer:
 
         # Step 2: Collect weights from actor rank 0 and send to SGLang servers
         # Ray's object store handles GPU tensor transfer efficiently
-        weights = ray.get(self.actor_wg.get_collected_weights())
+        # get_collected_weights returns list from all ranks, only rank 0 has weights
+        all_weights = ray.get(self.actor_wg.get_collected_weights())
+        weights = all_weights[0]  # Only rank 0 collected weights
 
         # Step 3: Send weights to all SGLang servers in batches
         # Use batching to reduce memory pressure for large models
