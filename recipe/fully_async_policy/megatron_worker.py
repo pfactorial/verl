@@ -47,8 +47,14 @@ def get_inference_model(rollout):
     Args:
         rollout: rollout object
     Returns:
-        model: model object
+        model: model object, or None for SGLang (which uses HTTP-based weight sync)
     """
+    # Check if this is an SGLang ServerAdapter (HTTP-based, no direct model access)
+    if not hasattr(rollout, "inference_engine"):
+        # SGLang uses ServerAdapter which doesn't have inference_engine
+        # Weight sync for SGLang is handled differently (via sgl_update_weights)
+        return None
+
     inference_engine = rollout.inference_engine
     if hasattr(inference_engine, "llm_engine"):
         inference_model = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
@@ -84,11 +90,14 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         if self._is_actor and self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
         params_generator = self._get_actor_params_generator() if self._is_actor else None
+        inference_model = None
         if self._is_rollout:
             inference_model = get_inference_model(self.rollout)
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            # Only apply vLLM-specific patch if we have a vLLM inference model
+            if inference_model is not None:
+                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            patch_vllm_moe_model_weight_loader(inference_model)
+                patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
             if self._is_actor:
                 weight_key, weight = next(params_generator)
@@ -102,7 +111,9 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
             from ray.util.collective import collective
 
             collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
-            if self._is_rollout:
+            # Only load weights for vLLM (inference_model is not None)
+            # SGLang uses HTTP-based weight sync which is handled separately
+            if self._is_rollout and inference_model is not None:
                 inference_model.load_weights([(key, tensor)])
         if self._is_actor and self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
@@ -160,11 +171,14 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         inference_model = None
         if self._is_rollout:
             inference_model = get_inference_model(self.rollout)
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            # Only apply vLLM-specific patch if we have a vLLM inference model
+            if inference_model is not None:
+                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            patch_vllm_moe_model_weight_loader(inference_model)
+                patch_vllm_moe_model_weight_loader(inference_model)
 
         # Update the checkpoint with the inference model and broadcast weights
+        # For SGLang (inference_model=None), checkpoint_engine will skip weight loading
         self.checkpoint_engine.update_checkpoint(
             inference_model=inference_model,
             group_name=sync_group_name,
