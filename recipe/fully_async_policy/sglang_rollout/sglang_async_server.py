@@ -416,6 +416,17 @@ class SGLangHttpServerForPartial:
         # Get inference TP size from config
         infer_tp_size = self.config.tensor_model_parallel_size
 
+        # Convert bf16 weights to fp8 if quantization is enabled (matches sync training)
+        quantization = self.config.get("quantization", None)
+        if quantization == "fp8":
+            from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
+            logger.info(f"[SGLang Server {self.replica_rank}] Converting bf16 weights to fp8 format...")
+            weights = quant_weights_by_name(
+                weights,
+                self.model_config.hf_config.quantization_config,
+                dtype=getattr(self.model_config.hf_config, "dtype", torch.bfloat16),
+            )
+
         logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
 
         # Serialize each tensor using SGLang's internal format
