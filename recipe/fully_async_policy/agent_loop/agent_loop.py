@@ -296,10 +296,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             for replica_rank in range(num_replicas)
         ]
 
-        if self.worker_group:
-            await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
-        else:
-            await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
+        # For fully async training, always use init_standalone to load real weights
+        # The rollout runs separately from the trainer, so it needs its own model copy
+        # init_hybrid uses load_format="dummy" which doesn't load actual weights
+        await asyncio.gather(*[server.init_standalone() for server in self.rollout_replicas])
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
