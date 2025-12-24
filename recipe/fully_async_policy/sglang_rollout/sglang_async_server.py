@@ -399,27 +399,17 @@ class SGLangHttpServerForPartial:
     # ==================== Weight Sync Methods ====================
 
     async def load_weights(self, weights: list[tuple[str, torch.Tensor]], flush_cache: bool = True):
-        """Load weights into the SGLang model.
+        """Load weights into the SGLang model via HTTP.
 
         This method receives weights from actor workers (via Ray object store)
-        and loads them into the SGLang model via tokenizer_manager.
-
-        Note: SGLang HTTP servers are CPU-only Ray actors with GPU subprocesses,
-        so they can't participate in NCCL directly. Weight tensors are passed
-        via Ray's object store which handles GPU tensor transfer efficiently.
-
-        The serialization format follows SGLang's internal weight sync mechanism:
-        1. Each tensor is serialized with MultiprocessingSerializer
-        2. Tensors are wrapped in LocalSerializedTensor (one value per TP rank)
-        3. The entire list is serialized and sent to the engine
-
-        We receive FULL weights (not sharded) and replicate them for all TP ranks.
-        SGLang's model loader handles sharding internally when loading.
+        and loads them into the SGLang model via HTTP endpoint.
 
         Args:
             weights: List of (name, tensor) tuples to load
             flush_cache: Whether to flush the KV cache after loading (default True)
         """
+        import base64
+        import aiohttp
         from sglang.srt.model_executor.model_runner import LocalSerializedTensor
         from sglang.srt.utils import MultiprocessingSerializer
 
@@ -441,25 +431,32 @@ class SGLangHttpServerForPartial:
 
             # Wrap in LocalSerializedTensor
             # Replicate full weight for all TP ranks - SGLang's model loader handles sharding
-            # This matches synchronous training where each worker contributes its full weight
             named_tensors.append((name, LocalSerializedTensor(values=[serialized_tensor] * infer_tp_size)))
 
         # Serialize the entire list of named tensors
-        # One entry per TP rank (each entry is identical, as in synchronous training)
         serialized_named_tensors = [
             MultiprocessingSerializer.serialize(named_tensors)
             for _ in range(infer_tp_size)
         ]
 
-        # Create update request
-        req = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=serialized_named_tensors,
-            load_format=None,
-            flush_cache=flush_cache,
-        )
+        # Base64 encode for HTTP transport (same as AsyncHttpServerAdapter)
+        encoded_tensors = [
+            base64.b64encode(t).decode("utf-8") for t in serialized_named_tensors
+        ]
 
-        # Send to tokenizer_manager for model update
-        await self.tokenizer_manager.update_weights_from_tensor(req.model_dump(), None)
+        # Send via HTTP to the local server
+        url = f"http://{self._server_address}:{self._server_port}/update_weights_from_tensor"
+        payload = {
+            "serialized_named_tensors": encoded_tensors,
+            "load_format": None,
+            "flush_cache": flush_cache,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Weight update failed: {resp.status} - {text}")
 
         logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
 
