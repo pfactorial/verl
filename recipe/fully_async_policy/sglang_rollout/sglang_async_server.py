@@ -421,10 +421,12 @@ class SGLangHttpServerForPartial:
         if quantization == "fp8":
             from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
             logger.info(f"[SGLang Server {self.replica_rank}] Converting bf16 weights to fp8 format...")
+            # Use default FP8 blockwise config (128x128 blocks) - same as SGLang default
+            quant_config = {"weight_block_size": [128, 128]}
             weights = quant_weights_by_name(
                 weights,
-                self.model_config.hf_config.quantization_config,
-                dtype=getattr(self.model_config.hf_config, "dtype", torch.bfloat16),
+                quant_config,
+                dtype=torch.bfloat16,
             )
 
         logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors (infer_tp={infer_tp_size})...")
