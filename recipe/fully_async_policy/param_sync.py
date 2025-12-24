@@ -204,10 +204,12 @@ class ParameterSynchronizer:
 
         batch_count = 0
         for weight_batch in get_named_tensor_buckets(iter(weights), update_weights_bucket_bytes):
+            # Put weights in object store first to avoid serialization issues
+            weight_batch_ref = ray.put(weight_batch)
             # Send this batch to all SGLang servers in parallel
             # Don't flush cache until all batches are loaded
             sglang_futures = [
-                server.load_weights.remote(weight_batch, flush_cache=False)
+                server.load_weights.remote(weight_batch_ref, flush_cache=False)
                 for server in self.sglang_servers
             ]
             ray.get(sglang_futures)
