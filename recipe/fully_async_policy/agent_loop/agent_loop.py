@@ -356,3 +356,20 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+
+    def get_sglang_servers(self):
+        """Get all SGLang server actors for NCCL-based weight sync.
+
+        Returns:
+            list: List of SGLangHttpServerForPartial actor handles, or empty list for vLLM
+        """
+        if self.rollout_replicas is None:
+            return []
+
+        # Each replica has a list of server actors (one per node in multi-node case)
+        # For single-node, each replica has one server
+        all_servers = []
+        for replica in self.rollout_replicas:
+            if hasattr(replica, "servers"):
+                all_servers.extend(replica.servers)
+        return all_servers

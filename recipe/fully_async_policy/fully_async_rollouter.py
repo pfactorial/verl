@@ -201,6 +201,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         """Get rollout worker group"""
         return self.rollout_wg
 
+    def get_sglang_servers(self):
+        """Get SGLang server actors for NCCL-based weight sync.
+
+        For SGLang backend, returns the actual HTTP server actors (not ServerAdapter workers).
+        These servers have GPUs and can participate in NCCL collective for weight sync.
+
+        Returns:
+            list: List of SGLangHttpServerForPartial actor handles, or empty list for vLLM
+        """
+        if self.agent_loop_manager is None:
+            return []
+        return self.agent_loop_manager.get_sglang_servers()
+
     def get_max_queue_size(self):
         return self.max_queue_size
 
