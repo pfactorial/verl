@@ -245,6 +245,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # Dynamically select replica class based on rollout engine
         rollout_name = config.actor_rollout_ref.rollout.name
         self.rollout_replica_class = get_fully_async_replica_class(rollout_name)
+        print(f"[FullyAsyncAgentLoopManager] Using rollout engine: {rollout_name}, replica class: {self.rollout_replica_class.__name__}")
 
         self.rm_resource_pool = rm_resource_pool
         self.rollout_replicas = None
@@ -325,9 +326,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             list[AgentLoopOutput]: Processing results
         """
+        print(f"[FullyAsyncAgentLoopManager] generate_single_sample_async called, sample size: {len(sample)}")
         worker = self._select_best_worker()
         output_future = worker.generate_sequences_no_post.remote(sample, partial_output_list)
-        return await asyncio.wrap_future(output_future.future())
+        result = await asyncio.wrap_future(output_future.future())
+        print(f"[FullyAsyncAgentLoopManager] generate_single_sample_async completed")
+        return result
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
