@@ -284,6 +284,8 @@ class SGLangHttpServerForPartial:
         )
         sampling_params = dict(sampling_params)  # Copy to avoid mutating
         sampling_params["max_new_tokens"] = max_new_tokens
+        # SGLang uses return_logprob at request level, not logprobs in sampling_params
+        sampling_params.pop("logprobs", None)
 
         request = GenerateReqInput(
             rid=request_id,
