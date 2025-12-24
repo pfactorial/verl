@@ -142,6 +142,20 @@ class SGLangHttpServerForPartial:
         attention_backend = engine_kwargs.pop("attention_backend", None)
         quantization = self.config.get("quantization", None)
         fp8_block_quant_kwargs = None
+
+        # In STANDALONE mode, we load bf16 weights from disk initially.
+        # Using quantization='fp8' with bf16 weights causes CUDA crashes because
+        # the FP8 kernels expect FP8-formatted weights.
+        # The trainer will sync FP8 weights after the first parameter sync.
+        # So we disable FP8 at startup for STANDALONE mode - weights will be bf16
+        # until the first weight sync from trainer.
+        if self.rollout_mode == RolloutMode.STANDALONE and quantization == "fp8":
+            logger.warning(
+                f"[SGLang Server {self.replica_rank}] STANDALONE mode with quantization='fp8' - "
+                "disabling FP8 at startup to load bf16 weights. FP8 weights will be synced from trainer."
+            )
+            quantization = None
+
         if quantization is not None:
             if quantization == "fp8":
                 assert sglang.__version__ >= "0.5.5", "sglang>=0.5.5 is required for FP8 quantization"
