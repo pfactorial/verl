@@ -49,7 +49,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_torch_device
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangReplica
@@ -398,61 +397,23 @@ class SGLangHttpServerForPartial:
             self.paused = False
 
     # ==================== Weight Sync Methods ====================
-    # These methods enable NCCL-based weight synchronization for optimal performance
 
-    def set_weights_info(self, weights_info: list[tuple[str, torch.Size, torch.dtype]]):
-        """Store weight metadata for NCCL-based sync.
+    async def load_weights(self, weights: list[tuple[str, torch.Tensor]]):
+        """Load weights into the SGLang model.
 
-        Args:
-            weights_info: List of (name, shape, dtype) tuples describing the weights
-        """
-        self._weights_info = weights_info
+        This method receives weights from actor workers (via Ray object store)
+        and loads them into the SGLang model via tokenizer_manager.
 
-    def get_weights_info(self):
-        """Get stored weight metadata."""
-        return getattr(self, "_weights_info", None)
-
-    async def sync_weights_from_broadcast(self, sync_group_name: str = "actor_rollout"):
-        """Receive weights via NCCL broadcast and load them into the model.
-
-        This method:
-        1. Receives weights from actor workers via NCCL collective broadcast
-        2. Loads weights into the SGLang model via tokenizer_manager
-
-        Args:
-            sync_group_name: Name of the NCCL collective group
-
-        Note:
-            This provides vLLM-equivalent performance by using NCCL for weight transfer
-            instead of HTTP serialization.
-        """
-        from ray.util.collective import collective
-
-        assert hasattr(self, "_weights_info") and self._weights_info is not None, (
-            "weights_info not set. Call set_weights_info() first."
-        )
-
-        # Collect weights from NCCL broadcast
-        weights_to_load = []
-        for key, shape, dtype in self._weights_info:
-            # Create tensor to receive broadcast
-            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
-
-            # Receive broadcast from actor rank 0
-            collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
-
-            weights_to_load.append((key, tensor))
-
-        # Load weights into SGLang model
-        await self._load_weights_into_model(weights_to_load)
-
-    async def _load_weights_into_model(self, weights: list[tuple[str, torch.Tensor]]):
-        """Load weights into the SGLang model via tokenizer_manager.
+        Note: SGLang HTTP servers are CPU-only Ray actors with GPU subprocesses,
+        so they can't participate in NCCL directly. Weight tensors are passed
+        via Ray's object store which handles GPU tensor transfer efficiently.
 
         Args:
             weights: List of (name, tensor) tuples to load
         """
         from sglang.srt.weight_sync.utils import named_tensor_to_bytes
+
+        logger.info(f"[SGLang Server {self.replica_rank}] Loading {len(weights)} weight tensors...")
 
         # Serialize weights for SGLang's internal update mechanism
         serialized_tensors = []
@@ -473,7 +434,7 @@ class SGLangHttpServerForPartial:
         # Send to tokenizer_manager for model update
         await self.tokenizer_manager.update_weights_from_tensor(req.model_dump(), None)
 
-        logger.info(f"[SGLang Server {self.replica_rank}] Loaded {len(weights)} weight tensors")
+        logger.info(f"[SGLang Server {self.replica_rank}] Weight loading complete")
 
 
 class FullyAsyncSGLangReplica(SGLangReplica):

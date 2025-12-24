@@ -51,6 +51,8 @@ class ParameterSynchronizer:
         if self.is_sglang:
             self.sglang_servers = ray.get(rollouter.get_sglang_servers.remote())
             print(f"[ParameterSynchronizer] Using SGLang backend with {len(self.sglang_servers)} servers")
+            # Note: SGLang servers are CPU-only Ray actors, they can't participate in NCCL
+            # Weight sync uses Ray object store for GPU tensor transfer instead
 
         # Basic attributes
         self.weights_info = None
@@ -83,28 +85,26 @@ class ParameterSynchronizer:
     def _init_weights_info(self):
         self.weights_info = self.actor_wg.get_actor_weights_info()[0]
 
-        if self.is_sglang:
-            # For SGLang, set weights_info on the SGLang servers
-            ray.get([server.set_weights_info.remote(self.weights_info) for server in self.sglang_servers])
-        else:
+        if not self.is_sglang:
             # For vLLM, set on rollout workers
+            # SGLang doesn't need this - weights are passed directly via load_weights()
             self.rollout_wg.set_actor_weights_info(self.weights_info)
 
     def _init_sync_group(self):
         print("[ParameterSynchronizer] Initializing parameter synchronization group...")
 
         if self.is_sglang:
-            # For SGLang, create collective with actor workers + SGLang server actors
-            # SGLang servers have GPUs and can participate in NCCL
-            actor_sglang_workers = self.actor_wg.workers + self.sglang_servers
+            # For SGLang, only create collective among actor workers
+            # SGLang servers are CPU-only Ray actors with GPU subprocesses,
+            # they can't participate in NCCL directly
             collective.create_collective_group(
-                actor_sglang_workers,
-                len(actor_sglang_workers),
-                list(range(0, len(actor_sglang_workers))),
+                self.actor_wg.workers,
+                len(self.actor_wg.workers),
+                list(range(0, len(self.actor_wg.workers))),
                 backend=get_nccl_backend(),
                 group_name=self.sync_group_name,
             )
-            print(f"[ParameterSynchronizer] SGLang NCCL group: {len(self.actor_wg.workers)} actors + {len(self.sglang_servers)} SGLang servers")
+            print(f"[ParameterSynchronizer] SGLang NCCL group: {len(self.actor_wg.workers)} actor workers only")
         else:
             # For vLLM, create collective with actor workers + rollout workers
             actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
@@ -170,27 +170,34 @@ class ParameterSynchronizer:
             ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
 
     def _sync_weights_sglang(self):
-        """Sync weights for SGLang backend using SGLang server actors.
+        """Sync weights for SGLang backend.
 
-        This method:
-        1. Actor workers broadcast weights via NCCL
-        2. SGLang servers receive weights via NCCL and load them into models
+        SGLang HTTP servers are CPU-only Ray actors that spawn GPU subprocesses,
+        so they can't participate in NCCL collective directly. Instead:
 
-        This provides vLLM-equivalent performance because:
-        - Uses NCCL for GPU-to-GPU weight transfer (no HTTP serialization)
-        - SGLang servers load weights directly
+        1. Actor workers sync weights among themselves via NCCL (fast, GPU-to-GPU)
+        2. Actor rank 0 collects weights and passes to SGLang servers via Ray
+        3. SGLang servers load weights via their internal mechanism
+
+        This is slightly slower than vLLM's direct NCCL approach, but still avoids
+        HTTP serialization overhead by using Ray's efficient GPU tensor transfer.
         """
-        # Actor workers broadcast weights, SGLang servers receive and load
-        # Both happen in parallel via the NCCL collective
-        actor_futures = self.actor_wg.sync_rollout_weights(self.sync_group_name)
+        # Step 1: Actor workers sync weights among themselves via NCCL
+        # This is fast GPU-to-GPU transfer within actor workers
+        ray.get(self.actor_wg.sync_actor_weights_internal(self.sync_group_name))
+
+        # Step 2: Collect weights from actor rank 0 and send to SGLang servers
+        # Ray's object store handles GPU tensor transfer efficiently
+        weights = ray.get(self.actor_wg.get_collected_weights())
+
+        # Step 3: Send weights to all SGLang servers in parallel
+        # Each server loads weights via tokenizer_manager
         sglang_futures = [
-            server.sync_weights_from_broadcast.remote(self.sync_group_name)
+            server.load_weights.remote(weights)
             for server in self.sglang_servers
         ]
-
-        # Wait for all to complete
-        ray.get(actor_futures)
         ray.get(sglang_futures)
+
         print(f"[ParameterSynchronizer] SGLang weight sync complete: {len(self.sglang_servers)} servers updated")
 
     def wait_last_valid(self):

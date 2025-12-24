@@ -118,6 +118,53 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         if self._is_actor and self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def sync_actor_weights_internal(self, sync_group_name="actor_rollout"):
+        """Sync weights among actor workers only (for SGLang backend).
+
+        Unlike sync_rollout_weights, this only syncs among actor workers.
+        SGLang servers receive weights via Ray object store, not NCCL.
+        """
+        assert self._is_actor and not self.config.hybrid_engine
+        assert hasattr(self, "_weights_info") and self._weights_info is not None
+
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+
+        params_generator = self._get_actor_params_generator()
+
+        # Collect weights on rank 0 for passing to SGLang servers
+        self._collected_weights = []
+
+        for key, shape, dtype in self._weights_info:
+            weight_key, weight = next(params_generator)
+            assert key == weight_key
+            assert shape == weight.size()
+            assert dtype == weight.dtype
+
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if torch.distributed.get_rank() == 0:
+                tensor.copy_(weight)
+
+            from ray.util.collective import collective
+            collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+
+            # Rank 0 collects all weights for SGLang
+            if torch.distributed.get_rank() == 0:
+                self._collected_weights.append((key, tensor.clone()))
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+
+    @register(dispatch_mode=Dispatch.RANK_ZERO)
+    def get_collected_weights(self):
+        """Get collected weights from rank 0 for SGLang weight sync."""
+        if not hasattr(self, "_collected_weights"):
+            return []
+        weights = self._collected_weights
+        self._collected_weights = []  # Clear after returning
+        return weights
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_model_to_cpu(self, n):
         if not hasattr(self, "cpu_saved_models"):
