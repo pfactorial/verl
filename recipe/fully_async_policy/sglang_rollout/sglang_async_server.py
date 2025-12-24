@@ -421,19 +421,6 @@ class SGLangHttpServerForPartial:
         if quantization == "fp8":
             from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
             logger.info(f"[SGLang Server {self.replica_rank}] Converting bf16 weights to fp8 format...")
-
-            # Initialize dummy distributed group if not already initialized
-            # (quant_weights_by_name uses torch.distributed.get_rank() for logging)
-            if not torch.distributed.is_initialized():
-                import os
-                # Use file-based init to avoid port conflicts between replicas
-                torch.distributed.init_process_group(
-                    backend="gloo",
-                    init_method=f"file:///tmp/dist_init_{os.getpid()}",
-                    world_size=1,
-                    rank=0,
-                )
-
             # Use default FP8 blockwise config (128x128 blocks) - same as SGLang default
             quant_config = {"weight_block_size": [128, 128]}
             weights = quant_weights_by_name(

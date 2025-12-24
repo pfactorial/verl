@@ -22,6 +22,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _get_rank_safe() -> int:
+    """Get distributed rank, returning 0 if not initialized."""
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
 def should_quantize_param(param_name: str) -> bool:
     """Determine whether to quantize to FP8 based on parameter name
 
@@ -85,7 +92,7 @@ def scaled_fp8_blockwise(
     # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
-    if torch.distributed.get_rank() == 0:
+    if _get_rank_safe() == 0:
         d0_ok = data_hp.shape[0] % 128 == 0
         d1_ok = data_hp.shape[1] % 128 == 0
         if not (d0_ok and d1_ok):
@@ -160,7 +167,7 @@ def quant_weights_by_name(weights, quant_config, dtype=torch.bfloat16):
         raise ValueError("weight_block_size not found in quant_config")
 
     for k, v in weights:
-        if torch.distributed.get_rank() == 0:
+        if _get_rank_safe() == 0:
             print(f"[FP8 DEBUG] {k}: shape={v.shape}, quantize={should_quantize_param(k)}")
 
         # Check if quantization is needed
@@ -171,7 +178,7 @@ def quant_weights_by_name(weights, quant_config, dtype=torch.bfloat16):
         # Quantize to FP8
         try:
             if weight_block_size is not None:
-                if torch.distributed.get_rank() == 0:
+                if _get_rank_safe() == 0:
                     logger.debug(f"  Quantizing to FP8 blockwise: {k}")
                 param_lp, param_scale = scaled_fp8_blockwise(
                     v.to(dtype),
