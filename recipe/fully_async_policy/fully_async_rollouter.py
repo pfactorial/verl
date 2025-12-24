@@ -210,9 +210,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         Returns:
             list: List of SGLangHttpServerForPartial actor handles, or empty list for vLLM
         """
-        if self.agent_loop_manager is None:
+        if self.async_rollout_manager is None:
             return []
-        return self.agent_loop_manager.get_sglang_servers()
+        return self.async_rollout_manager.get_sglang_servers()
 
     def get_max_queue_size(self):
         return self.max_queue_size
